@@ -1,0 +1,9 @@
+build/server
+build/server.o
+build/client
+build/client.o
+build/keygen
+build/keygen.o
+build/*.key
+build/data.bin
+.claude/
