@@ -12,12 +12,38 @@ tcp_send:
     ret
 
 ; ─────────────────────────────────────────────────────────────
-; tcp_recv — получить данные из сокета
-; rdi=sock, rsi=buf, rdx=maxlen → rax=bytes_read (0=закрыт)
+; tcp_recv — получить ровно rdx байт из сокета (цикл до получения всех)
+; rdi=sock, rsi=buf, rdx=len → rax=len (0=EOF/ошибка)
 ; ─────────────────────────────────────────────────────────────
 tcp_recv:
-    mov rax, 0          ; sys_read
+    push rbx
+    push r12
+    push r13
+    mov  r12, rdi          ; r12 = sock
+    mov  r13, rsi          ; r13 = buf (сдвигается)
+    mov  rbx, rdx          ; rbx = осталось прочитать
+.recv_loop:
+    test rbx, rbx
+    jz   .recv_done
+    mov  rax, 0            ; sys_read
+    mov  rdi, r12
+    mov  rsi, r13
+    mov  rdx, rbx
     syscall
+    test rax, rax
+    jle  .recv_eof         ; 0=закрыт, <0=ошибка
+    add  r13, rax
+    sub  rbx, rax
+    jmp  .recv_loop
+.recv_eof:
+    xor  rax, rax
+    jmp  .recv_ret
+.recv_done:
+    mov  rax, r13          ; ненулевой — успех
+.recv_ret:
+    pop  r13
+    pop  r12
+    pop  rbx
     ret
 
 ; ─────────────────────────────────────────────────────────────
@@ -51,15 +77,12 @@ send_u64:
 ; rdi=sock → rax=value
 ; ─────────────────────────────────────────────────────────────
 recv_u64:
-    push rbx
     sub  rsp, 8
-    mov  rax, 0
     mov  rsi, rsp
     mov  rdx, 8
-    syscall
+    call tcp_recv
     mov  rax, [rsp]
     add  rsp, 8
-    pop  rbx
     ret
 
 ; ─────────────────────────────────────────────────────────────

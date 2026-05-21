@@ -132,8 +132,8 @@ mod_inverse:
 
     ; (old_s, s) ← (s, old_s − q*s)
     push rax            ; save q
-    imul rax, rbx       ; rax = q * s
-    sub  r14, rax       ; r14 = old_s − q*s  (новое s)
+    imul rbx            ; rdx:rax = q * s (128-бит, rdx отбрасывается)
+    sub  r14, rax       ; r14 = old_s − q*s  (результат всегда влезает в 64 бит)
     xchg r14, rbx       ; r14 = старое s (новое old_s), rbx = новое s
     pop  rax
 
@@ -280,12 +280,12 @@ rsa_keygen:
 
 .gen:
     ; генерируем p
-    call gen_prime16
+    call gen_prime32
     mov  r15, rax       ; r15 = p
 
     ; генерируем q ≠ p
 .gen_q:
-    call gen_prime16
+    call gen_prime32
     cmp  rax, r15
     je   .gen_q
     mov  rbx, rax       ; rbx = q
@@ -318,6 +318,30 @@ rsa_keygen:
     mov rsi, rbp
     call mod_inverse
     mov [r14], rax
+
+    ; --- round-trip верификация ключей ---
+    ; test_msg = φ(n)/3  (< n, т.к. φ(n) < n)
+    xor  rdx, rdx
+    mov  rax, rbp
+    mov  rcx, 3
+    div  rcx
+    mov  r15, rax       ; r15 = test_msg (p больше не нужен)
+
+    ; enc = test_msg ^ e mod n
+    mov  rdi, r15
+    mov  rsi, RSA_E
+    mov  rdx, [r12]
+    call rsa_modexp
+
+    ; dec = enc ^ d mod n
+    mov  rdi, rax
+    mov  rsi, [r14]
+    mov  rdx, [r12]
+    call rsa_modexp
+
+    ; dec должен совпасть с test_msg — иначе d вычислен неверно
+    cmp  rax, r15
+    jne  .gen
 
     pop rbp
     pop r15

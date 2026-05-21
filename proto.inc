@@ -28,6 +28,7 @@ CMD_GET_PUBKEY      equ 0x0A    ; username(32)
 CMD_SEND_MSG        equ 0x0B    ; chat_id(8) + enc_sender(8) + MAX_MSG_BLOCKS×enc_block(8)
 CMD_GET_MSGS        equ 0x0C    ; chat_id(8)
 CMD_LIST_MY_CHATS   equ 0x0D    ; (нет данных) — только чаты текущего пользователя
+CMD_GET_USER_BY_NPART equ 0x0E  ; npart(8) → RESP_OK+username(32) или RESP_ERR
 
 ; ─────────────────────────────────────────────────────────────
 ; Ответы: Сервер → Клиент
@@ -39,7 +40,7 @@ RESP_CHAT_LIST      equ 0x13    ; count(4) + chat[]: id(8)+name(32)+n(8)+e(8)
 RESP_CHAT_KEY       equ 0x14    ; enc_key(8) + chat_n(8)
 RESP_MSGS           equ 0x15    ; count(4) + msg[]: enc_sender_n(8)+enc_msg(8)
 RESP_PUBKEY         equ 0x16    ; n(8) + e(8)
-RESP_CHAT_ID        equ 0x17    ; chat_id(8)
+RESP_CHAT_ID        equ 0x17    ; (устарело — клиент знает chat_n сам)
 
 ; ─────────────────────────────────────────────────────────────
 ; Размеры полей (байты)
@@ -52,11 +53,11 @@ CHAT_ID_SIZE        equ 8
 ; ─────────────────────────────────────────────────────────────
 ; Размеры записей хранилища (используются в сервере и клиенте)
 ; ─────────────────────────────────────────────────────────────
-USER_REC        equ USERNAME_LEN + KEY_SIZE * 2         ; 48
-CHAT_REC        equ CHAT_ID_SIZE + CHAT_NAME_LEN + KEY_SIZE * 2  ; 56
-CHAT_KEY_REC    equ CHAT_ID_SIZE + USERNAME_LEN + KEY_SIZE       ; 48
-MAX_MSG_BLOCKS  equ 43                                           ; 43 × 6 = 258 байт (до 252 символов)
-MSG_REC         equ CHAT_ID_SIZE + KEY_SIZE * (1 + MAX_MSG_BLOCKS) ; 360
+USER_REC        equ (USERNAME_LEN + KEY_SIZE * 2)                  ; 48
+CHAT_REC        equ (CHAT_ID_SIZE + CHAT_NAME_LEN + KEY_SIZE * 2)  ; 56
+CHAT_KEY_REC    equ (CHAT_ID_SIZE + USERNAME_LEN + KEY_SIZE)        ; 48
+MAX_MSG_BLOCKS  equ 43                                              ; 43 × 6 = 258 байт (до 252 символов)
+MSG_REC         equ (CHAT_ID_SIZE + KEY_SIZE * (1 + MAX_MSG_BLOCKS)) ; 360
 
 ; Смещения полей User
 USER_NAME       equ 0

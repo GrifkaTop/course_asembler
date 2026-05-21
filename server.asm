@@ -34,7 +34,7 @@ LOCAL_SIZE      equ 560
 THREAD_FLAGS    equ 0x00000D11
 
 ; Размер блока данных для сохранения (от user_count до конца messages)
-DATA_SIZE equ 5*8 + MAX_USERS*USER_REC + MAX_CHATS*CHAT_REC + MAX_CHAT_KEYS*CHAT_KEY_REC + MAX_MESSAGES*MSG_REC
+DATA_SIZE equ 4*8 + MAX_USERS*USER_REC + MAX_CHATS*CHAT_REC + MAX_CHAT_KEYS*CHAT_KEY_REC + MAX_MESSAGES*MSG_REC
 
 ; ─────────────────────────────────────────────────────────────
 section '.data' writable
@@ -67,7 +67,6 @@ section '.bss' writable
     chat_count      rq 1
     chat_key_count  rq 1
     msg_count       rq 1
-    next_chat_id    rq 1
 
     ; хранилища
     users           rb MAX_USERS     * USER_REC
@@ -225,6 +224,8 @@ handle_client:
     je   .do_get_msgs
     cmp  rbp, CMD_LIST_MY_CHATS
     je   .do_list_my_chats
+    cmp  rbp, CMD_GET_USER_BY_NPART
+    je   .do_get_user_by_npart
     call send_err
     jmp  .next_cmd
 
@@ -297,9 +298,8 @@ handle_client:
     syscall
     mov  rax, [rsp]
     add  rsp, 8
-    xor  rdx, rdx
-    div  qword [r15 + USER_N]        ; rdx = challenge mod n → challenge < n
-    mov  [r14 + LOCAL_CHALLENGE], rdx
+    btr  rax, 63                     ; сбрасываем бит 63: challenge < 2^63 < n
+    mov  [r14 + LOCAL_CHALLENGE], rax
 
     ; шифруем pubkey пользователя: enc = challenge^e mod n
     mov  rdi, [r14 + LOCAL_CHALLENGE]
@@ -395,15 +395,15 @@ handle_client:
     cmp  qword [chat_count], MAX_CHATS
     jge  .cc_full
 
-    inc  qword [next_chat_id]
-    mov  rbx, [next_chat_id]
+    ; chat_n (публичный ключ чата) от клиента — это и есть идентификатор чата
+    mov  rbx, qword [r14 + LOCAL_RECV + CHAT_NAME_LEN]
 
     mov  rax, [chat_count]
     mov  rcx, CHAT_REC
     mul  rcx
     lea  r15, [chats + rax]
 
-    mov  qword [r15 + CHAT_ID_OFF], rbx
+    mov  qword [r15 + CHAT_ID_OFF], rbx   ; CHAT_ID = chat_n
     lea  rdi, [r15 + CHAT_NAME_OFF]
     lea  rsi, [r14 + LOCAL_RECV]
     mov  rcx, CHAT_NAME_LEN + KEY_SIZE * 2
@@ -413,12 +413,7 @@ handle_client:
     call release_lock
     call save_data
 
-    mov  rdi, r13
-    mov  sil, RESP_CHAT_ID
-    call send_byte
-    mov  rdi, r13
-    mov  rsi, rbx
-    call send_u64
+    call send_ok
     jmp  .next_cmd
 
 .cc_full:
@@ -554,9 +549,8 @@ handle_client:
     syscall
     mov  rax, [rsp]
     add  rsp, 8
-    xor  rdx, rdx
-    div  qword [r15 + CHAT_N_OFF]    ; rdx = challenge mod n → challenge < n
-    mov  [r14 + LOCAL_CHALLENGE], rdx
+    btr  rax, 63                     ; сбрасываем бит 63: challenge < 2^63 < n
+    mov  [r14 + LOCAL_CHALLENGE], rax
 
     ; шифруем ПУБЛИЧНЫМ ключом чата (доказывает наличие ПРИВАТНОГО)
     mov  rdi, [r14 + LOCAL_CHALLENGE]
@@ -746,6 +740,44 @@ handle_client:
     jmp  .lmc_send
 .lmc_send_done:
     call release_lock
+    jmp  .next_cmd
+
+; ── GET_USER_BY_NPART ────────────────────────────────────────
+.do_get_user_by_npart:
+    ; recv npart(8) — нижние 6 байт n отправителя
+    mov  rdi, r13
+    lea  rsi, [r14 + LOCAL_RECV]
+    mov  rdx, KEY_SIZE
+    call tcp_recv
+
+    mov  rbx, qword [r14 + LOCAL_RECV]  ; rbx = npart
+
+    call acquire_lock
+    xor  r15, r15           ; r15 = индекс
+.gunp_loop:
+    cmp  r15, [user_count]
+    jge  .gunp_miss
+    imul rax, r15, USER_REC
+    lea  rdx, [users + rax]
+    mov  rax, qword [rdx + USER_N]
+    shl  rax, 16
+    shr  rax, 16            ; нижние 6 байт user_n
+    cmp  rax, rbx
+    je   .gunp_found
+    inc  r15
+    jmp  .gunp_loop
+.gunp_miss:
+    call release_lock
+    call send_err
+    jmp  .next_cmd
+.gunp_found:
+    mov  r15, rdx           ; r15 = &user_record
+    call release_lock
+    call send_ok
+    mov  rdi, r13
+    lea  rsi, [r15 + USER_NAME]
+    mov  rdx, USERNAME_LEN
+    call tcp_send
     jmp  .next_cmd
 
 ; ── Общий выход с ошибкой ────────────────────────────────────

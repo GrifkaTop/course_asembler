@@ -12,11 +12,25 @@ include 'net.inc'
 ; ─────────────────────────────────────────────────────────────
 ; Локальное хранилище ключей чатов
 ; ─────────────────────────────────────────────────────────────
-MAX_LOCAL_CHATS equ 8
+MAX_LOCAL_CHATS equ 16
 LCHAT_ID        equ 0   ; u64
 LCHAT_N         equ 8   ; u64 — модуль чата
 LCHAT_D         equ 16  ; u64 — приватный ключ чата
 LCHAT_SIZE      equ 24
+
+MAX_CHATS_UI    equ 16  ; максимум чатов в списке UI
+
+; Кэш fingerprint → имя отправителя
+MAX_KEY_CACHE   equ 32
+KCACHE_NPART    equ 0
+KCACHE_NAME     equ 8
+KCACHE_SIZE     equ 40
+
+; Буфер декодированных сообщений (двухпроходной вывод)
+MAX_DMSG        equ 256
+DMSG_NPART      equ 0
+DMSG_TEXT       equ 8
+DMSG_SIZE       equ 272
 
 ; ─────────────────────────────────────────────────────────────
 section '.data' writable
@@ -26,7 +40,7 @@ section '.data' writable
     msg_ask_choice  db "Выбор: ", 0
     msg_ask_msg     db "Сообщение: ", 0
     msg_ask_cname   db "Название чата: ", 0
-    msg_ask_chatid  db "ID чата (Enter = назад): ", 0
+    msg_ask_chatid  db "Номер чата (Enter = назад): ", 0
     msg_ask_user    db "Имя пользователя: ", 0
     ; Меню
     msg_menu        db 10, "=== МЕНЮ ===", 10, \
@@ -66,10 +80,12 @@ section '.data' writable
     msg_colon       db ": ", 0
     msg_nl          db 10, 0
     msg_sep         db 10, "------------------------------------", 10, 10, 0
-    msg_created     db "Чат создан, ID: ", 0
-    msg_chat_hdr    db "=== ЧАТ ID: ", 0
-    msg_chat_input  db 10, "Введите сообщение (Enter = выйти): ", 0
+    msg_created     db "Чат создан, ключ: ", 0
+    msg_chat_hdr    db "=== ЧАТ: ", 0
+    msg_dot_space   db ". ", 0
+    msg_chat_input  db 10, "Введите Сообщение (Enter = выйти): ", 0
     str_clear       db 27, '[', '2', 'J', 27, '[', 'H', 0
+    str_unknown     db "???", 0
 
     ; server_addr для connect (как в референсе)
     server_addr:
@@ -98,6 +114,12 @@ section '.bss' writable
     lchats          rb MAX_LOCAL_CHATS * LCHAT_SIZE
     lchat_count     rq 1
 
+    ; Список чатов для UI (обновляется при каждом показе)
+    chat_list_n     rq MAX_CHATS_UI              ; массив chat_n в порядке отображения
+    chat_list_name  rb MAX_CHATS_UI * CHAT_NAME_LEN  ; имена чатов в порядке отображения
+    chat_list_count rq 1
+    cur_chat_name   rb CHAT_NAME_LEN             ; имя текущего чата
+
     ; Буферы
     key_buf         rb 24 + USERNAME_LEN    ; буфер для чтения .key файла
     filename_buf    rb USERNAME_LEN + 8
@@ -105,6 +127,15 @@ section '.bss' writable
     input_buf       rb 256
     recv_buf        rb 512
     reg_mode        rb 1
+    u64_scratch     rb 24                   ; scratch для print_u64 (не пересекается с input_buf)
+
+    ; Кэш fingerprint (нижние 6 байт n) → имя
+    key_cache       rb MAX_KEY_CACHE * KCACHE_SIZE
+    key_cache_cnt   rq 1
+
+    ; Буфер декодированных сообщений (двухпроходной вывод)
+    dmsg_buf        rb MAX_DMSG * DMSG_SIZE
+    dmsg_count      rq 1
 
     ; Временные переменные
     tmp_n           rq 1
@@ -452,6 +483,13 @@ cmd_auth:
     mov  rdi, msg_nl
     call print_str
 
+    ; кэшируем свой fingerprint → своё имя
+    mov  rdi, [my_n]
+    shl  rdi, 16
+    shr  rdi, 16         ; нижние 6 байт my_n
+    lea  rsi, [my_username]
+    call cache_add_name
+
     mov  rax, 1
     ret
 .fail:
@@ -461,10 +499,15 @@ cmd_auth:
     ret
 
 ; ─────────────────────────────────────────────────────────────
-; cmd_list_chats — получить и вывести список чатов
+; cmd_list_chats — получить и вывести нумерованный список чатов
+; Заполняет chat_list_n[] и chat_list_count
 ; ─────────────────────────────────────────────────────────────
 cmd_list_chats:
     push rbx
+    push r12
+
+    mov  qword [chat_list_count], 0
+    xor  r12, r12               ; r12 = 0-based индекс
 
     mov  rdi, [sock_fd]
     mov  sil, CMD_LIST_MY_CHATS
@@ -490,28 +533,42 @@ cmd_list_chats:
     test rbx, rbx
     jz   .done
 
-    ; принимаем одну запись: id(8) + name(32) + n(8) + e(8) = 56 байт
+    ; принимаем одну запись: CHAT_REC байт
     mov  rdi, [sock_fd]
     lea  rsi, [recv_buf]
     mov  rdx, CHAT_REC
     call tcp_recv
 
-    ; выводим "id : X : название : chatname"
-    mov  rdi, msg_chat_id
-    call print_str
-    mov  rdi, qword [recv_buf]
+    ; сохраняем chat_n (= chat_id) и имя в массивах
+    mov  rax, qword [recv_buf + CHAT_ID_OFF]
+    cmp  r12, MAX_CHATS_UI
+    jge  .skip_save
+    imul rcx, r12, 8
+    mov  qword [chat_list_n + rcx], rax
+    imul rax, r12, CHAT_NAME_LEN
+    lea  rdi, [chat_list_name + rax]
+    lea  rsi, [recv_buf + CHAT_NAME_OFF]
+    mov  rcx, CHAT_NAME_LEN
+    rep  movsb
+    inc  qword [chat_list_count]
+.skip_save:
+
+    ; выводим "N. chatname"
+    lea  rdi, [r12 + 1]
     call print_u64
-    mov  rdi, msg_chat_name
+    mov  rdi, msg_dot_space
     call print_str
-    lea  rdi, [recv_buf + CHAT_ID_SIZE]
+    lea  rdi, [recv_buf + CHAT_NAME_OFF]
     call print_str
     mov  rdi, msg_nl
     call print_str
 
+    inc  r12
     dec  rbx
     jmp  .recv_loop
 
 .done:
+    pop  r12
     pop  rbx
     ret
 
@@ -525,6 +582,10 @@ cmd_create_chat:
     ; запрашиваем название (Enter = отмена)
     mov  rdi, msg_ask_cname
     call print_str
+    lea  rdi, [input_buf]
+    xor  al, al
+    mov  rcx, CHAT_NAME_LEN
+    rep  stosb
     lea  rdi, [input_buf]
     mov  rsi, CHAT_NAME_LEN - 1
     call read_line
@@ -564,16 +625,14 @@ cmd_create_chat:
     mov  rsi, [tmp_e]
     call send_u64
 
-    ; получаем RESP_CHAT_ID + chat_id
+    ; получаем RESP_OK (chat_n клиент уже знает сам)
     call recv_response
-    cmp  al, RESP_CHAT_ID
+    cmp  al, RESP_OK
     jne  .fail
 
-    mov  rdi, [sock_fd]
-    call recv_u64
-    mov  rbx, rax           ; rbx = chat_id
+    mov  rbx, [tmp_n]       ; rbx = chat_n = chat_id
 
-    ; сохраняем ключ чата локально
+    ; сохраняем ключ чата локально: chat_id = chat_n
     mov  rdi, rbx
     mov  rsi, [tmp_n]
     mov  rdx, [tmp_d]
@@ -651,7 +710,19 @@ cmd_enter_chat:
     cmp  byte [input_buf], 0
     je   .leave
     call parse_u64
-    mov  rbx, rax           ; rbx = chat_id
+    test rax, rax
+    jz   .leave
+    dec  rax                         ; 0-based индекс
+    cmp  rax, [chat_list_count]
+    jge  .leave
+    imul rcx, rax, 8
+    mov  rbx, [chat_list_n + rcx]   ; rbx = chat_n = chat_id
+    ; сохраняем имя текущего чата
+    imul rcx, rax, CHAT_NAME_LEN
+    lea  rsi, [chat_list_name + rcx]
+    lea  rdi, [cur_chat_name]
+    mov  rcx, CHAT_NAME_LEN
+    rep  movsb
 
     ; ищем ключ локально
     mov  rdi, rbx
@@ -716,8 +787,8 @@ cmd_enter_chat:
     call clear_screen
     mov  rdi, msg_chat_hdr
     call print_str
-    mov  rdi, [cur_chat_id]
-    call print_u64
+    lea  rdi, [cur_chat_name]
+    call print_str
     mov  rdi, msg_nl
     call print_str
 
@@ -816,7 +887,8 @@ cmd_read_msgs:
     push r13
     push r14
     push r15
-    sub  rsp, 272       ; [rsp+0..7]=имя, [rsp+8..265]=сообщение, [266..271]=pad
+
+    mov  qword [dmsg_count], 0
 
     mov  rdi, [sock_fd]
     mov  sil, CMD_GET_MSGS
@@ -827,71 +899,202 @@ cmd_read_msgs:
 
     call recv_response
     cmp  al, RESP_MSGS
-    jne  .done
+    jne  .crm_done
 
     mov  rdi, [sock_fd]
     call recv_u64
     mov  rbx, rax
 
     test rbx, rbx
-    jnz  .msg_loop
+    jnz  .crm_recv_loop
     mov  rdi, msg_no_msgs
     call print_str
-    jmp  .done
+    jmp  .crm_done
 
-.msg_loop:
+    ; ── Проход 1: принимаем и декодируем все записи в dmsg_buf ──
+.crm_recv_loop:
     test rbx, rbx
-    jz   .done
+    jz   .crm_resolve
 
-    ; получаем полный MSG_REC в recv_buf
     mov  rdi, [sock_fd]
     lea  rsi, [recv_buf]
     mov  rdx, MSG_REC
     call tcp_recv
 
-    ; расшифровываем имя отправителя (6 байт → u64 с нулями в старших байтах)
+    ; слот в dmsg_buf
+    imul r12, [dmsg_count], DMSG_SIZE
+    lea  r12, [dmsg_buf + r12]
+
+    ; декодируем fingerprint отправителя
     mov  rdi, qword [recv_buf + MSG_SENDER_OFF]
     mov  rsi, [cur_chat_d]
     mov  rdx, [cur_chat_n]
     call rsa_decrypt
-    mov  qword [rsp], rax   ; [rsp+0..5]=имя, [rsp+6..7]=0
+    shl  rax, 16
+    shr  rax, 16             ; нижние 6 байт = fingerprint
+    mov  qword [r12 + DMSG_NPART], rax
 
-    ; расшифровываем MAX_MSG_BLOCKS блоков в [rsp+8..265]
-    lea  r12, [recv_buf + MSG_BODY_OFF]
-    lea  r13, [rsp + 8]
-    mov  r14, MAX_MSG_BLOCKS
-.decode_block:
-    test r14, r14
-    jz   .decode_done
-    mov  rdi, qword [r12]
+    ; декодируем MAX_MSG_BLOCKS блоков текста
+    lea  r13, [recv_buf + MSG_BODY_OFF]
+    lea  r14, [r12 + DMSG_TEXT]
+    mov  r15, MAX_MSG_BLOCKS
+.crm_decode_block:
+    test r15, r15
+    jz   .crm_decode_done
+    mov  rdi, qword [r13]
     mov  rsi, [cur_chat_d]
     mov  rdx, [cur_chat_n]
-    call rsa_decrypt        ; r12, r13, r14 сохраняются внутри rsa_modexp
-    mov  qword [r13], rax   ; 6 байт текста + 2 нулевых байта
-    add  r12, 8
-    add  r13, 6
-    dec  r14
-    jmp  .decode_block
-.decode_done:
-    mov  byte [r13], 0      ; гарантированный нулевой терминатор
+    call rsa_decrypt
+    mov  qword [r14], rax
+    add  r13, 8
+    add  r14, 6
+    dec  r15
+    jmp  .crm_decode_block
+.crm_decode_done:
+    mov  byte [r14], 0
 
-    ; выводим "имя: сообщение\n"
-    lea  rdi, [rsp]
+    inc  qword [dmsg_count]
+    dec  rbx
+    jmp  .crm_recv_loop
+
+    ; ── Проход 2: запрашиваем имена неизвестных отправителей ────
+.crm_resolve:
+    call resolve_all_senders
+
+    ; ── Проход 3: выводим сообщения ─────────────────────────────
+    xor  r12, r12
+.crm_print_loop:
+    cmp  r12, [dmsg_count]
+    jge  .crm_done
+
+    imul r13, r12, DMSG_SIZE
+    lea  r13, [dmsg_buf + r13]
+
+    mov  rdi, qword [r13 + DMSG_NPART]
+    call cache_lookup_name
+    test rax, rax
+    jnz  .crm_print_name
+    lea  rax, [str_unknown]
+.crm_print_name:
+    mov  rdi, rax
     call print_str
     mov  rdi, msg_colon
     call print_str
-    lea  rdi, [rsp + 8]
+    lea  rdi, [r13 + DMSG_TEXT]
     call print_str
     mov  rdi, msg_nl
     call print_str
 
-    dec  rbx
-    jmp  .msg_loop
+    inc  r12
+    jmp  .crm_print_loop
 
-.done:
-    add  rsp, 272
+.crm_done:
     pop  r15
     pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    ret
+
+; ─────────────────────────────────────────────────────────────
+; cache_add_name — добавить fingerprint→имя в кэш
+; rdi = npart (u64), rsi = &name (USERNAME_LEN байт)
+; ─────────────────────────────────────────────────────────────
+cache_add_name:
+    push rbx
+    cmp  qword [key_cache_cnt], MAX_KEY_CACHE
+    jge  .can_done
+    imul rax, [key_cache_cnt], KCACHE_SIZE
+    lea  rbx, [key_cache + rax]
+    mov  qword [rbx + KCACHE_NPART], rdi
+    lea  rdi, [rbx + KCACHE_NAME]
+    mov  rcx, USERNAME_LEN
+    rep  movsb
+    inc  qword [key_cache_cnt]
+.can_done:
+    pop  rbx
+    ret
+
+; ─────────────────────────────────────────────────────────────
+; cache_lookup_name — найти fingerprint в кэше
+; rdi = npart → rax = &name или 0
+; ─────────────────────────────────────────────────────────────
+cache_lookup_name:
+    push rbx
+    xor  rbx, rbx
+.cln_loop:
+    cmp  rbx, [key_cache_cnt]
+    jge  .cln_miss
+    imul rax, rbx, KCACHE_SIZE
+    lea  rdx, [key_cache + rax]
+    cmp  qword [rdx + KCACHE_NPART], rdi
+    je   .cln_hit
+    inc  rbx
+    jmp  .cln_loop
+.cln_miss:
+    xor  rax, rax
+    jmp  .cln_done
+.cln_hit:
+    lea  rax, [rdx + KCACHE_NAME]
+.cln_done:
+    pop  rbx
+    ret
+
+; ─────────────────────────────────────────────────────────────
+; resolve_all_senders — запросить имена неизвестных отправителей
+; Для каждого уникального fingerprint в dmsg_buf без записи в
+; key_cache посылает CMD_GET_USER_BY_NPART и кэширует ответ.
+; ─────────────────────────────────────────────────────────────
+resolve_all_senders:
+    push rbx
+    push r12
+    push r13
+    xor  r12, r12           ; i = 0
+.ras_loop:
+    cmp  r12, [dmsg_count]
+    jge  .ras_done
+
+    imul r13, r12, DMSG_SIZE
+    lea  r13, [dmsg_buf + r13]
+
+    mov  rdi, qword [r13 + DMSG_NPART]
+    call cache_lookup_name
+    test rax, rax
+    jnz  .ras_next         ; уже в кэше
+
+    ; запрашиваем у сервера
+    mov  rdi, [sock_fd]
+    mov  sil, CMD_GET_USER_BY_NPART
+    call send_byte
+    mov  rdi, [sock_fd]
+    mov  rsi, qword [r13 + DMSG_NPART]
+    call send_u64
+
+    call recv_response
+    cmp  al, RESP_OK
+    jne  .ras_unknown
+
+    ; получаем username(32)
+    mov  rdi, [sock_fd]
+    lea  rsi, [recv_buf]
+    mov  rdx, USERNAME_LEN
+    call tcp_recv
+
+    mov  rdi, qword [r13 + DMSG_NPART]
+    lea  rsi, [recv_buf]
+    call cache_add_name
+    jmp  .ras_next
+
+.ras_unknown:
+    mov  rdi, qword [r13 + DMSG_NPART]
+    lea  rsi, [str_unknown]
+    call cache_add_name
+
+.ras_next:
+    inc  r12
+    jmp  .ras_loop
+
+.ras_done:
     pop  r13
     pop  r12
     pop  rbx
@@ -907,10 +1110,10 @@ cmd_send_msg:
     push r14
     push r15
 
-    ; enc_sender = rsa_encrypt(первые 6 байт имени пользователя)
-    mov  rdi, qword [my_username]
+    ; enc_sender = rsa_encrypt(нижние 6 байт my_n) — fingerprint публичного ключа
+    mov  rdi, [my_n]
     shl  rdi, 16
-    shr  rdi, 16                   ; обнуляем старшие 2 байта → 6 байт (< 2^48 < n)
+    shr  rdi, 16                   ; нижние 6 байт my_n (< 2^48 < chat_n)
     mov  rsi, RSA_E
     mov  rdx, [cur_chat_n]
     call rsa_encrypt
@@ -980,7 +1183,7 @@ cmd_invite:
     push rbx
     push r12
 
-    ; показываем список чатов и спрашиваем ID
+    ; показываем нумерованный список чатов
     call clear_screen
     call cmd_list_chats
 
@@ -994,7 +1197,13 @@ cmd_invite:
     cmp  byte [input_buf], 0
     je   .leave_invite
     call parse_u64
-    mov  rbx, rax           ; rbx = chat_id
+    test rax, rax
+    jz   .leave_invite
+    dec  rax                         ; 0-based индекс
+    cmp  rax, [chat_list_count]
+    jge  .leave_invite
+    imul rcx, rax, 8
+    mov  rbx, [chat_list_n + rcx]   ; rbx = chat_n = chat_id
 
     mov  rdi, msg_ask_user
     call print_str
@@ -1030,12 +1239,58 @@ cmd_invite:
     mov  rdi, [sock_fd]
     call recv_u64           ; target_e (игнорируем, всегда 65537)
 
-    ; находим chat_d для этого чата
+    ; кэшируем fingerprint приглашённого: r12=target_n, input_buf=username
+    push rdi
+    mov  rdi, r12
+    shl  rdi, 16
+    shr  rdi, 16            ; нижние 6 байт target_n
+    lea  rsi, [input_buf]
+    call cache_add_name
+    pop  rdi
+
+    ; находим chat_d для этого чата (локально или с сервера)
     mov  rdi, rbx
     call find_local_chat_key
     test rax, rax
-    jz   .fail_lchat
+    jnz  .inv_have_key
 
+    ; нет локально — запрашиваем с сервера
+    mov  rdi, [sock_fd]
+    mov  sil, CMD_GET_KEY
+    call send_byte
+    mov  rdi, [sock_fd]
+    mov  rsi, rbx
+    call send_u64
+
+    call recv_response
+    cmp  al, RESP_CHAT_KEY
+    jne  .fail_lchat
+
+    mov  rdi, [sock_fd]
+    call recv_u64           ; enc_chat_d
+    push rax
+
+    mov  rdi, [sock_fd]
+    call recv_u64           ; chat_n (нужен для расшифровки через my_d)
+    push rax
+
+    pop  rsi                ; rsi = chat_n (для save)
+    pop  rdi                ; rdi = enc_chat_d
+
+    push rsi                ; сохраняем chat_n
+    mov  rsi, [my_d]
+    mov  rdx, [my_n]
+    call rsa_decrypt        ; rax = chat_d
+
+    mov  rdx, rax           ; rdx = chat_d
+    pop  rsi                ; rsi = chat_n
+    mov  rdi, rbx           ; rdi = chat_id
+    call save_local_chat_key
+
+    mov  rdi, rbx
+    call find_local_chat_key
+
+.inv_have_key:
     mov  rdx, [rax + LCHAT_D]   ; rdx = chat_d
 
     ; enc_key = rsa_encrypt(chat_d, target_e=65537, target_n)
@@ -1158,7 +1413,7 @@ print_u64:
     push rbp
 
     mov  rax, rdi
-    lea  rbx, [input_buf + 19]
+    lea  rbx, [u64_scratch + 19]
 
     test rax, rax
     jnz  .convert
@@ -1179,7 +1434,7 @@ print_u64:
 
 .print:
     inc  rbx
-    lea  rcx, [input_buf + 20]
+    lea  rcx, [u64_scratch + 20]
     sub  rcx, rbx           ; длина
     mov  rdi, 1
     mov  rsi, rbx

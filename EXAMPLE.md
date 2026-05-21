@@ -1,48 +1,42 @@
 # Пример использования
 
 ---
-
-## Запуск сервера
-
-![Запуск сервера](images/image-1.png)
-
----
 # Регистрация 
 
-![alt text](image.png)
+![alt text](images/image.png)
 
 ---
 
 ## Главное меню
 
-![Главное меню](images/image-4.png)
+![alt text](images/image-1.png)
 
 ---
 
 ## Создание чата
 
-![Создание чата](images/image-5.png)
+![alt text](images/image-2.png)
 
 ---
 
 ## Приглашение в чат
 
-![Приглашение в чат](images/image-7.png)
+![alt text](images/image-3.png)
 
 ---
 
 ## Вход в чат
 
-![Вход в чат](images/image-8.png)
+![alt text](images/image-4.png)
 
 ---
 
 ## Чат
 
-![Чат](images/image-9.png)
+![alt text](images/image-5.png)
 
 ---
 
 ## Сервер (логи)
 
-![Сервер](images/image-10.png)
+![alt text](images/image-7.png)
